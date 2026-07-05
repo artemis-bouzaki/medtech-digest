@@ -1,9 +1,10 @@
 """
 Medtech / Health-AI research digest.
 
-Pulls recent papers from arXiv and PubMed, filters them against a keyword
-watchlist, summarises the relevant ones with Claude, and emails a short
-digest. Designed to run twice a week via GitHub Actions.
+Pulls recent papers from arXiv and PubMed, and recent articles from a set of
+medtech news RSS feeds. Papers are filtered by keyword watchlist; news items
+are NOT keyword-filtered, instead Claude judges relevance during summarisation. Sends the
+result as a short HTML digest email.
 
 Configure everything in the CONFIG section below, and set these as
 GitHub Actions secrets (Settings -> Secrets and variables -> Actions):
@@ -15,7 +16,9 @@ GitHub Actions secrets (Settings -> Secrets and variables -> Actions):
   EMAIL_TO            - where the digest should be sent (can be same as SMTP_USER)
 """
 
+import json
 import os
+import re
 import smtplib
 import ssl
 import textwrap
@@ -25,17 +28,14 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-
-import json
+from email.utils import parsedate_to_datetime
 
 # ============================== CONFIG ======================================
 
-# How far back to look for new papers each run (keep this >= your schedule
-# interval so you don't miss anything if a run fails).
-LOOKBACK_DAYS = 5
+LOOKBACK_DAYS = 5  # how far back to look each run; keep >= your schedule interval
 
-# Your watchlist. Case-insensitive substring match against title + abstract.
-# Edit this freely -- it's the main lever for relevance.
+# --- Papers (arXiv + PubMed): keyword-filtered -------------------------------
+
 KEYWORDS = [
     "radiotherapy",
     "pseudo-CT",
@@ -61,77 +61,58 @@ KEYWORDS = [
     "federated learning imaging",
 ]
 
-# arXiv categories to search within (physics.med-ph, eess.IV = image/video
-# processing, cs.CV = computer vision -- these three cover most medical
-# imaging AI preprints).
 ARXIV_CATEGORIES = ["eess.IV", "cs.CV", "physics.med-ph"]
-
-# PubMed search terms (broader clinical/journal side). This is OR'd with
-# the KEYWORDS list automatically -- edit only if you want extra PubMed-only
-# terms.
 PUBMED_EXTRA_TERMS = ["radiotherapy AI", "medical imaging deep learning"]
 
-MAX_ITEMS_PER_SOURCE = 40          # how many raw records to pull before filtering
-MAX_ITEMS_IN_EMAIL = 20            # cap so the email stays short
+# --- News (RSS): not keyword-filtered, agent (Claude) judges relevance --------------
+
+RSS_FEEDS = {
+    "MobiHealthNews": "https://www.mobihealthnews.com/feed",
+    "Fierce Biotech (Medtech)": "https://www.fiercebiotech.com/rss/medtech/xml",
+    "MedCity News": "https://medcitynews.com/feed",
+    "Medtech Dive": "https://www.medtechdive.com/feeds/news",
+}
+
+# What relevant means when agent filters news. Edit this to steer things.
+RELEVANCE_BRIEF = textwrap.dedent("""
+    Relevant: radiotherapy AI/oncology imaging, medical imaging AI more broadly,
+    FDA clearances or funding rounds for imaging/oncology/medical technology AI companies, clinical
+    AI deployment/regulatory news, women's health / femtech AI, and healthtech
+    startup news relevant to someone considering a founder or early technical
+    hire role in this space.
+    Not relevant: general hospital operations/policy/insurance news, unrelated
+    disease areas with no AI/imaging angle, consumer wellness content, biology/drug discovery startups.
+""").strip()
+
+MAX_ITEMS_PER_SOURCE = 40    # raw records pulled per source before filtering/dedup
+MAX_PAPERS_IN_EMAIL = 15
+MAX_NEWS_IN_EMAIL = 10
 ANTHROPIC_MODEL = "claude-sonnet-4-6"
 
 # =============================================================================
 
 
-def anthropic_summarize(items):
-    """Summarize a batch of papers in one Claude call. Returns list of dicts
-    with an added 'summary' field, in the same order as input."""
-    api_key = os.environ["ANTHROPIC_API_KEY"]
+def normalize_title(title):
+    """Lowercase, strip punctuation/whitespace variance, for dedup matching."""
+    t = title.lower().strip()
+    t = re.sub(r"[^a-z0-9 ]", "", t)
+    t = re.sub(r"\s+", " ", t)
+    return t
 
-    numbered = "\n\n".join(
-        f"[{i}] TITLE: {it['title']}\nABSTRACT: {it['abstract'][:1200]}"
-        for i, it in enumerate(items)
-    )
 
-    prompt = textwrap.dedent(f"""
-        You are helping a radiotherapy/medical-imaging AI researcher triage
-        new papers. Their focus areas: radiotherapy outcome prediction, pseudo-CT
-        synthesis from MRI/PET, pelvic/sacral insufficiency fracture detection,
-        statistical shape modelling, breast MRI treatment response prediction,
-        and clinical AI deployment/calibration.
-
-        For each paper below, write ONE plain-English sentence (max 30 words)
-        capturing what's actually new or useful about it for someone in this
-        field -- not a generic abstract rephrase. Be direct; skip filler like
-        "This paper presents".
-
-        Return ONLY a JSON array of strings, one per paper, in the same order,
-        no preamble, no markdown fences.
-
-        Papers:
-        {numbered}
-    """).strip()
-
-    body = json.dumps({
-        "model": ANTHROPIC_MODEL,
-        "max_tokens": 2000,
-        "messages": [{"role": "user", "content": prompt}],
-    }).encode()
-
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data = json.loads(resp.read())
-
-    text = "".join(block["text"] for block in data["content"] if block["type"] == "text")
-    text = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-    summaries = json.loads(text)
-
-    for it, summary in zip(items, summaries):
-        it["summary"] = summary
-    return items
+def dedup_items(items):
+    """Drop items whose normalized title we've already seen. Keeps first
+    occurrence (arXiv/PubMed/news feeds are processed in a fixed order, so
+    this is deterministic run to run)."""
+    seen = set()
+    out = []
+    for it in items:
+        key = normalize_title(it["title"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+    return out
 
 
 def matches_keywords(text, keywords):
@@ -139,9 +120,9 @@ def matches_keywords(text, keywords):
     return any(kw.lower() in text_lower for kw in keywords)
 
 
+# --------------------------------- arXiv ------------------------------------
+
 def fetch_arxiv():
-    """Query arXiv API for recent papers in the configured categories,
-    then filter locally by keyword."""
     since = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
     cat_query = " OR ".join(f"cat:{c}" for c in ARXIV_CATEGORIES)
     params = {
@@ -176,6 +157,7 @@ def fetch_arxiv():
             continue
 
         results.append({
+            "type": "paper",
             "source": "arXiv",
             "title": title,
             "abstract": abstract,
@@ -185,9 +167,9 @@ def fetch_arxiv():
     return results
 
 
+# -------------------------------- PubMed ------------------------------------
+
 def fetch_pubmed():
-    """Query PubMed via NCBI E-utilities for recent items matching the
-    keyword list, then fetch abstracts."""
     since = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
     date_str = since.strftime("%Y/%m/%d")
 
@@ -211,11 +193,7 @@ def fetch_pubmed():
     if not ids:
         return []
 
-    efetch_params = {
-        "db": "pubmed",
-        "id": ",".join(ids),
-        "retmode": "xml",
-    }
+    efetch_params = {"db": "pubmed", "id": ",".join(ids), "retmode": "xml"}
     efetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?" + urllib.parse.urlencode(efetch_params)
 
     with urllib.request.urlopen(efetch_url, timeout=30) as resp:
@@ -238,6 +216,7 @@ def fetch_pubmed():
             continue
 
         results.append({
+            "type": "paper",
             "source": "PubMed",
             "title": title,
             "abstract": abstract or "(no abstract available)",
@@ -247,26 +226,198 @@ def fetch_pubmed():
     return results
 
 
-def build_email_html(items):
-    date_label = datetime.now().strftime("%A %d %B %Y")
+# ---------------------------------- RSS -------------------------------------
+
+def _parse_rss_date(date_str):
+    """RSS dates are usually RFC 822 (email-style). Fall back gracefully."""
+    if not date_str:
+        return None
+    try:
+        return parsedate_to_datetime(date_str)
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_rss_feed(source_name, feed_url):
+    """Fetch and parse a single RSS 2.0 feed. No keyword filtering here --
+    relevance is judged later by agent (claude). Only filters by LOOKBACK_DAYS."""
+    since = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
+
+    req = urllib.request.Request(feed_url, headers={"User-Agent": "Mozilla/5.0 (digest-bot)"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = resp.read()
+
+    root = ET.fromstring(raw)
+    results = []
+
+    # Standard RSS 2.0: <rss><channel><item>...
+    for item in root.findall(".//item")[:MAX_ITEMS_PER_SOURCE]:
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        description = (item.findtext("description") or "").strip()
+        # strip any HTML tags that sneak into description
+        description = re.sub(r"<[^>]+>", " ", description)
+        description = re.sub(r"\s+", " ", description).strip()
+
+        pub_date_str = item.findtext("pubDate")
+        pub_dt = _parse_rss_date(pub_date_str)
+        if pub_dt:
+            if pub_dt.tzinfo is None:
+                pub_dt = pub_dt.replace(tzinfo=timezone.utc)
+            if pub_dt < since:
+                continue
+
+        if not title:
+            continue
+
+        results.append({
+            "type": "news",
+            "source": source_name,
+            "title": title,
+            "abstract": description[:1500],
+            "url": link,
+        })
+
+    return results
+
+
+def fetch_all_news():
+    all_news = []
+    for name, url in RSS_FEEDS.items():
+        try:
+            items = fetch_rss_feed(name, url)
+            print(f"  {name}: {len(items)} items in window")
+            all_news.extend(items)
+        except Exception as e:
+            print(f"  {name}: FAILED ({e})")
+    return all_news
+
+
+# ------------------------------ agent calls --------------------------------
+
+def anthropic_process(items):
+    """
+    Single batched Claude call that:
+      - writes a one-sentence summary for every 'paper' item (already
+        keyword-filtered, so always kept)
+      - judges relevance for every 'news' item against RELEVANCE_BRIEF, and
+        writes a summary only for the ones it keeps
+
+    Returns (kept_items) with a 'summary' field added, dropping any news
+    items Claude judged irrelevant.
+    """
     if not items:
-        body = "<p>No new matching papers today.</p>"
-    else:
+        return []
+
+    api_key = os.environ["ANTHROPIC_API_KEY"]
+
+    numbered = "\n\n".join(
+        f"[{i}] TYPE: {it['type']}\nSOURCE: {it['source']}\nTITLE: {it['title']}\n"
+        f"TEXT: {it['abstract'][:1200]}"
+        for i, it in enumerate(items)
+    )
+
+    prompt = textwrap.dedent(f"""
+        You are helping a radiotherapy/medical-imaging AI researcher triage a
+        daily digest. Her focus areas: radiotherapy outcome prediction,
+        pseudo-CT synthesis from MRI/PET, pelvic/sacral insufficiency fracture
+        detection, statistical shape modelling, breast MRI treatment response
+        prediction, clinical AI deployment/calibration, and (for news items
+        specifically) healthtech/medtech industry developments relevant to
+        someone considering a founder or early technical hire role.
+
+        Below is a numbered list of items. Each is either a research paper
+        (TYPE: paper) or a news article (TYPE: news).
+
+        For TYPE: paper items -- these are already filtered as relevant.
+        Always keep them. Write ONE plain-English sentence (max 30 words)
+        saying what's actually new or useful about it -- not a generic
+        rephrase of the abstract. Skip filler like "This paper presents".
+
+        For TYPE: news items -- these are NOT pre-filtered. Judge relevance
+        using this brief:
+        {RELEVANCE_BRIEF}
+        Only keep news items that clearly match. For kept items, write ONE
+        plain-English sentence (max 30 words) on why it matters to her
+        specifically, not just a rephrase of the headline.
+
+        Return ONLY a JSON array, no preamble, no markdown fences. Each
+        element must be an object with exactly these fields:
+          "index": the item's number from the list
+          "keep": true or false (papers should always be true)
+          "summary": your one-sentence summary (omit or use "" if keep is false)
+
+        Items:
+        {numbered}
+    """).strip()
+
+    body = json.dumps({
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": 3000,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode()
+
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=90) as resp:
+        data = json.loads(resp.read())
+
+    text = "".join(block["text"] for block in data["content"] if block["type"] == "text")
+    text = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    decisions = json.loads(text)
+
+    by_index = {d["index"]: d for d in decisions}
+
+    kept = []
+    for i, it in enumerate(items):
+        decision = by_index.get(i)
+        if decision is None:
+            # Claude didn't return a decision for this item -- fail safe:
+            # keep papers (already filtered), drop news (unjudged relevance).
+            if it["type"] == "paper":
+                it["summary"] = ""
+                kept.append(it)
+            continue
+        if not decision.get("keep"):
+            continue
+        it["summary"] = decision.get("summary", "")
+        kept.append(it)
+
+    return kept
+
+
+# --------------------------------- Email ------------------------------------
+
+def build_email_html(papers, news):
+    date_label = datetime.now().strftime("%A %d %B %Y")
+
+    def render_section(title, items):
+        if not items:
+            return f'<h3 style="font-size:14px;color:#888;">{title}</h3><p style="font-size:13px;color:#aaa;">Nothing new.</p>'
         rows = []
         for it in items:
             rows.append(f"""
-                <div style="margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid #eee;">
+                <div style="margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid #eee;">
                   <div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:0.5px;">{it['source']}</div>
                   <a href="{it['url']}" style="font-size:15px;font-weight:600;color:#1a1a1a;text-decoration:none;">{it['title']}</a>
                   <p style="margin:6px 0 0 0;font-size:14px;color:#333;">{it.get('summary', '')}</p>
                 </div>
             """)
-        body = "".join(rows)
+        return f'<h3 style="font-size:14px;color:#888;margin-top:24px;">{title}</h3>' + "".join(rows)
+
+    body = render_section("Papers", papers) + render_section("News", news)
 
     return f"""
     <html><body style="font-family:-apple-system,Helvetica,Arial,sans-serif;max-width:640px;margin:0 auto;">
       <h2 style="font-size:18px;">Medtech / Health-AI digest -- {date_label}</h2>
-      <p style="font-size:13px;color:#888;">{len(items)} new items matched your watchlist.</p>
+      <p style="font-size:13px;color:#888;">{len(papers)} papers, {len(news)} news items.</p>
       {body}
     </body></html>
     """
@@ -289,6 +440,8 @@ def send_email(html_body, subject):
         server.sendmail(os.environ["SMTP_USER"], os.environ["EMAIL_TO"], msg.as_string())
 
 
+# ---------------------------------- Main ------------------------------------
+
 def main():
     print("Fetching arXiv...")
     arxiv_items = fetch_arxiv()
@@ -298,14 +451,28 @@ def main():
     pubmed_items = fetch_pubmed()
     print(f"  {len(pubmed_items)} matching PubMed items")
 
-    items = (arxiv_items + pubmed_items)[:MAX_ITEMS_IN_EMAIL]
+    print("Fetching news RSS feeds...")
+    news_items = fetch_all_news()
+    print(f"  {len(news_items)} total news items in window")
 
-    if items:
-        print(f"Summarizing {len(items)} items with Claude...")
-        items = anthropic_summarize(items)
+    papers = dedup_items(arxiv_items + pubmed_items)
+    news = dedup_items(news_items)
 
-    html = build_email_html(items)
-    subject = f"Medtech/Health-AI digest -- {len(items)} new items ({datetime.now().strftime('%d %b')})"
+    print(f"After dedup: {len(papers)} papers, {len(news)} news items")
+
+    all_items = papers[:MAX_PAPERS_IN_EMAIL] + news[:MAX_NEWS_IN_EMAIL * 2]  # send extra news for Claude to filter down
+
+    print(f"Sending {len(all_items)} items to Claude for summarizing/filtering...")
+    processed = anthropic_process(all_items) if all_items else []
+
+    final_papers = [it for it in processed if it["type"] == "paper"][:MAX_PAPERS_IN_EMAIL]
+    final_news = [it for it in processed if it["type"] == "news"][:MAX_NEWS_IN_EMAIL]
+
+    html = build_email_html(final_papers, final_news)
+    subject = (
+        f"Medtech/Health-AI digest -- {len(final_papers)} papers, "
+        f"{len(final_news)} news ({datetime.now().strftime('%d %b')})"
+    )
 
     print("Sending email...")
     send_email(html, subject)
