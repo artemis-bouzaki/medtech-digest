@@ -1,0 +1,3 @@
+# digest.py only uses the Python standard library (urllib, smtplib, xml.etree, json).
+# Nothing to install -- this file exists so the workflow's `pip install -r requirements.txt`
+# step doesn't error. Add packages here if you extend the script later.
