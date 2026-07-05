@@ -2,7 +2,7 @@
 
 Daily automated email summarising new arXiv preprints and PubMed papers matching
 a keyword watchlist, with each item summarised in one plain-English sentence by
-Claude. Runs entirely on GitHub Actions -- no server, no ongoing cost beyond
+Claude. Runs entirely on GitHub Actions. No server, no ongoing cost beyond
 Anthropic API usage (a daily digest of ~20 papers costs a fraction of a cent).
 
 ## What it does
@@ -19,8 +19,7 @@ Anthropic API usage (a daily digest of ~20 papers costs a fraction of a cent).
 
 ### 1. Create a repo
 
-Push these files to a new **private** GitHub repo (private is fine -- GitHub
-Actions and secrets work the same either way).
+Push these files to a new **private** GitHub repo (private is fine).
 
 ```bash
 cd medtech-digest
@@ -77,9 +76,8 @@ automation.
 
 ### 6. Let it run on schedule
 
-Once the manual test works, it'll run automatically every day at 07:00 UTC
-(edit the `cron` line in `.github/workflows/digest.yml` to change the time --
-cron times on GitHub Actions are always UTC).
+Once the manual test works, it'll run automatically every Monday/Thurdsay at 07:00 UTC
+(edit the `cron` line in `.github/workflows/digest.yml` to change the time and/or days).
 
 ## Customising
 
